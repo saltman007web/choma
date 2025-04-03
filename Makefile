@@ -6,7 +6,7 @@ DYLIB_LDFLAGS ?=
 
 DEBUG ?= 0
 ifeq ($(DEBUG), 1)
-	CFLAGS += -fsanitize=address -static-libsan
+	CFLAGS += -fsanitize=address
 endif
 DISABLE_SIGNING ?= 0
 DISABLE_TESTS ?= 0
@@ -17,7 +17,7 @@ INSTALL_PATH ?= /usr/local/
 ifeq ($(TARGET), ios)
 BUILD_DIR := build/ios
 OUTPUT_DIR := output/ios
-CFLAGS += -arch arm64 -arch arm64e -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=14.0
+CFLAGS += -arch arm64 -arch arm64e -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=11.0
 ifeq ($(DISABLE_SIGNING), 0)
 CFLAGS += external/ios/libcrypto.a
 endif

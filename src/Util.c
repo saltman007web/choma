@@ -1,5 +1,7 @@
 #include "Util.h"
 #include <stdio.h>
+#include <unistd.h>
+#include <string.h>
 
 int64_t sxt64(int64_t value, uint8_t bits)
 {
@@ -33,23 +35,6 @@ uint64_t align_to_size(int size, int alignment)
     return (size + alignment - 1) & ~(alignment - 1);
 }
 
-int count_digits(int64_t num)
-{
-    if (num == 0) {
-        return 1;
-    }
-    int digits = 0;
-    if (num < 0) {
-        num = -num;
-        digits++;
-    }
-    while (num != 0) {
-        num = num / 10;
-        digits++;
-    }
-    return digits;
-}
-
 void print_hash(uint8_t *hash, size_t size)
 {
     for (int j = 0; j < size; j++) {
@@ -63,6 +48,7 @@ void enumerate_range(uint64_t start, uint64_t end, uint16_t alignment, size_t nb
     if (alignment == 0) return;
     if (nbytes == 0) return;
     if (nbytes % alignment) return;
+    if (nbytes > (end - start)) return;
 
     int dir = start < end ? 1 : -1;
 
@@ -75,7 +61,58 @@ void enumerate_range(uint64_t start, uint64_t end, uint16_t alignment, size_t nb
         if (start <= end) return;
     }
 
-    for (uint64_t cur = start; (cur + (alignment * dir)) != end; cur += (dir * alignment)) {
+    for (uint64_t cur = start; dir == 1 ? (cur + (alignment * dir)) <= end : (cur + (alignment * dir)) >= end; cur += (dir * alignment)) {
         if (!enumerator(cur)) break;
+
+        // Extra condition to prevent underflow when we hit 0 and the direction is backwards
+        if (dir == -1 && cur == 0) break;
     }
+}
+
+int read_string(int fd, char **strOut)
+{
+    uint32_t sz = 0;
+    off_t pos = lseek(fd, 0, SEEK_CUR);
+    char c = 0;
+    do {
+        if (read(fd, &c, sizeof(c)) != sizeof(c)) return -1;
+        sz++;
+    } while(c != 0);
+    
+    lseek(fd, pos, SEEK_SET);
+    *strOut = malloc(sz);
+    read(fd, *strOut, sz);
+    return 0;
+}
+
+bool string_has_prefix(const char *str, const char *prefix)
+{
+    if (!str || !prefix) {
+		return false;
+	}
+
+	size_t str_len = strlen(str);
+	size_t prefix_len = strlen(prefix);
+
+	if (str_len < prefix_len) {
+		return false;
+	}
+
+	return !strncmp(str, prefix, prefix_len);
+}
+
+bool string_has_suffix(const char *str, const char *suffix)
+{
+    if (!str || !suffix) {
+		return false;
+	}
+
+	size_t str_len = strlen(str);
+	size_t suffix_len = strlen(suffix);
+
+	if (str_len < suffix_len) {
+		return false;
+	}
+
+	return !strcmp(str + str_len - suffix_len, suffix);
 }

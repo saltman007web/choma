@@ -332,6 +332,48 @@ int arm64_dec_mov_imm(uint32_t inst, arm64_register *destinationRegOut, uint64_t
     return 0;
 }
 
+int arm64_gen_mov_reg(arm64_register destinationReg, arm64_register sourceReg, uint32_t *bytesOut, uint32_t *maskOut)
+{
+    uint32_t inst = 0x2a0003e0;
+    uint32_t mask = 0x7fe0ffe0;
+
+    if (!ARM64_REG_IS_ANY(destinationReg) && !ARM64_REG_IS_ANY(sourceReg)) {
+        if (ARM64_REG_IS_W(destinationReg) != ARM64_REG_IS_W(sourceReg)) return -1;
+    }
+
+    if (!ARM64_REG_IS_ANY(destinationReg)) {
+        mask |= (1 << 31);
+        inst |= (ARM64_REG_IS_X(destinationReg) << 31);
+
+        inst |= (ARM64_REG_GET_NUM(destinationReg));
+        mask |= 0x1f;
+    }
+
+    if (!ARM64_REG_IS_ANY(sourceReg)) {
+        mask |= (1 << 31);
+        inst |= (ARM64_REG_IS_X(sourceReg) << 31);
+
+        inst |= (ARM64_REG_GET_NUM(sourceReg) << 16);
+        mask |= (0x1f << 16);
+    }
+
+    if (bytesOut) *bytesOut = inst;
+    if (maskOut) *maskOut = mask;
+
+    return 0;
+}
+
+int arm64_dec_mov_reg(uint32_t inst, arm64_register *destinationRegOut, arm64_register *sourceRegOut)
+{
+    if ((inst & 0x7fe0ffe0) != 0x2a0003e0) return -1;
+
+    bool is64 = inst & (1 << 31);
+    if (destinationRegOut) *destinationRegOut = ARM64_REG(is64 ? ARM64_REG_TYPE_X : ARM64_REG_TYPE_W, inst & 0x1f);
+    if (sourceRegOut) *sourceRegOut = ARM64_REG(is64 ? ARM64_REG_TYPE_X : ARM64_REG_TYPE_W, (inst >> 16) & 0x1f);
+
+    return 0;
+}
+
 int arm64_gen_add_imm(arm64_register destinationReg, arm64_register sourceReg, optional_uint64_t optImm, uint32_t *bytesOut, uint32_t *maskOut)
 {
     if (ARM64_REG_IS_ANY_VECTOR(destinationReg)) return -1;
@@ -399,6 +441,90 @@ int arm64_dec_add_imm(uint32_t inst, arm64_register *destinationRegOut, arm64_re
 
     return 0;
 }
+
+int arm64_gen_sub_imm(arm64_register destinationReg, arm64_register sourceReg, optional_uint64_t optImm, optional_bool optS, uint32_t *bytesOut, uint32_t *maskOut) {
+  if (ARM64_REG_IS_ANY_VECTOR(destinationReg)) return -1;
+  if (ARM64_REG_IS_ANY_VECTOR(sourceReg)) return -1;
+
+  if (!ARM64_REG_IS_ANY(destinationReg) && !ARM64_REG_IS_ANY(sourceReg)) {
+    // if both regs are set and have a mismatching width, abort
+    if (ARM64_REG_IS_W(destinationReg) != ARM64_REG_IS_W(sourceReg)) return -1;
+  }
+
+  uint32_t inst = 0x51000000;
+  uint32_t mask = 0x7f800000;
+  if(OPT_BOOL_IS_SET(optS)) {
+    bool s = OPT_BOOL_GET_VAL(optS);
+    if(s) {
+      inst = 0x71000000;
+      mask |= (1 << 29);
+      inst |= (1 << 29);
+    }
+  }
+
+  // if one is set and 32 bit, include 32 bit in mask and set it in inst
+  if (!ARM64_REG_IS_ANY(destinationReg)) {
+    mask |= (1 << 31);
+    inst |= ((uint32_t)(ARM64_REG_IS_X(destinationReg)) << 31);
+  }
+  else if (!ARM64_REG_IS_ANY(sourceReg)) {
+    mask |= (1 << 31);
+    inst |= ((uint32_t)(ARM64_REG_IS_X(sourceReg)) << 31);
+  }
+
+  if (!ARM64_REG_IS_ANY(destinationReg)) {
+    mask |= 0x1F;
+    inst |= (uint32_t)(ARM64_REG_GET_NUM(destinationReg));
+  }
+  if (!ARM64_REG_IS_ANY(sourceReg)) {
+    mask |= (0x1F << 5);
+    inst |= ((uint32_t)(ARM64_REG_GET_NUM(destinationReg)) << 5);
+  }
+
+  if (OPT_UINT64_IS_SET(optImm)) {
+    uint64_t imm = OPT_UINT64_GET_VAL(optImm);
+    if (imm & ~0xFFF) return -1;
+    mask |= (0xFFF << 10);
+    inst |= (imm << 10);
+  }
+
+  if (bytesOut) *bytesOut = inst;
+  if (maskOut) *maskOut = mask;
+  return 0;
+}
+
+int arm64_dec_sub_imm(uint32_t inst, arm64_register *destinationRegOut, arm64_register *sourceRegOut, uint16_t *immOut, bool *sOut) {
+  if ((inst & 0x7f800000) != 0x51000000) {
+    if ((inst & 0x7f800000) != 0x71000000) {
+      return -1;
+    }
+  }
+  bool is64 = (inst & 0x80000000);
+  bool isS = (inst & 0x20000000);
+  bool shift = (inst & 0x400000);
+
+  if (destinationRegOut) {
+    *destinationRegOut = ARM64_REG(is64 ? ARM64_REG_TYPE_X : ARM64_REG_TYPE_W, inst & 0x1F);
+  }
+  if (sourceRegOut) {
+    *sourceRegOut = ARM64_REG(is64 ? ARM64_REG_TYPE_X : ARM64_REG_TYPE_W, (inst >> 5) & 0x1F);
+  }
+
+  if (immOut) {
+    uint16_t imm = ((inst >> 10) & 0xFFF);
+    if (shift) {
+      imm = (imm << 12);
+    }
+    *immOut = imm;
+  }
+
+  if (sOut) {
+    *sOut = isS;
+  }
+
+  return 0;
+}
+
 
 static int _arm64_gen_str_ldr_imm(uint32_t inst, uint32_t mask, char type, arm64_ldr_str_type instType, arm64_register sourceDestinationReg, arm64_register addrReg, optional_uint64_t optImm, uint32_t *bytesOut, uint32_t *maskOut)
 {
@@ -659,6 +785,77 @@ int arm64_dec_ldr_lit(uint32_t inst, uint64_t origin, uint64_t *targetOut, arm64
         *targetOut = origin + (sxt64(imm, 19) * 4);
     }
 
+    return 0;
+}
+
+int arm64_gen_ldp(arm64_ldp_stp_type instType, arm64_register destinationReg1, arm64_register destinationReg2, arm64_register addrReg, optional_uint64_t optImm, uint32_t *bytesOut, uint32_t *maskOut)
+{
+    uint32_t inst = 0x28400000;
+    uint32_t mask = 0x7e400000;
+
+    if (!ARM64_REG_IS_ANY(destinationReg1) && !ARM64_REG_IS_ANY(destinationReg2)) {
+        if (ARM64_REG_IS_X(destinationReg1) != ARM64_REG_IS_X(destinationReg2)) {
+            return -1;
+        }
+    }
+
+    bool is64 = false;
+    if (!ARM64_REG_IS_ANY(destinationReg1) || !ARM64_REG_IS_ANY(destinationReg2)) {
+        if (!ARM64_REG_IS_ANY(destinationReg1)) {
+            is64 = ARM64_REG_IS_X(destinationReg1);
+        }
+        else {
+            is64 = ARM64_REG_IS_X(destinationReg2);
+        }
+        mask |=    (1 << 31);
+        inst |= (is64 << 31);
+    }
+
+    if (ARM64_REG_IS_ANY(destinationReg1) && ARM64_REG_IS_ANY(destinationReg2) && OPT_UINT64_IS_SET(optImm)) {
+        return -1;
+    }
+
+    if (instType != ARM64_LDP_STP_TYPE_ANY) {
+        mask |= (0b11 << 23);
+        switch (instType) {
+            case ARM64_LDP_STP_TYPE_POST_INDEX:
+            inst |= (0b01 << 23);
+            break;
+            case ARM64_LDP_STP_TYPE_PRE_INDEX:
+            inst |= (0b11 << 23);
+            break;
+            case ARM64_LDP_STP_TYPE_SIGNED:
+            inst |= (0b10 << 23);
+            break;
+            default:
+            break;
+        }
+    }
+
+    if (!ARM64_REG_IS_ANY(destinationReg1)) {
+        mask |= 0x1f;
+        inst |= ARM64_REG_GET_NUM(destinationReg1);
+    }
+    if (!ARM64_REG_IS_ANY(destinationReg2)) {
+        mask |= 0x1f << 10;
+        inst |= ARM64_REG_GET_NUM(destinationReg2) << 10;
+    }
+    if (!ARM64_REG_IS_ANY(addrReg)) {
+        mask |= 0x1f << 5;
+        inst |= ARM64_REG_GET_NUM(addrReg) << 5;
+    }
+    if (OPT_UINT64_IS_SET(optImm)) {
+        mask |= 0b1111111 << 15;
+        if (is64) {
+            inst |= OPT_UINT64_GET_VAL(optImm) / 8;
+        }
+        else {
+            inst |= OPT_UINT64_GET_VAL(optImm) / 4;
+        }
+    }
+
+    if (bytesOut) *bytesOut = inst;
+    if (maskOut) *maskOut = mask;
     return 0;
 }
 

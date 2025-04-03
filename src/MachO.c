@@ -1,18 +1,42 @@
-#include "FAT.h"
+#include "Fat.h"
 #include "FileStream.h"
 #include "MachO.h"
 #include "MachOByteOrder.h"
 #include "MachOLoadCommand.h"
-#include "CSBlob.h"
 #include "MemoryStream.h"
 
 #include <mach-o/loader.h>
-#import <mach-o/nlist.h>
+#include <mach-o/nlist.h>
+#include <mach/machine.h>
 #include <stdlib.h>
+#include <dlfcn.h>
 
 int macho_read_at_offset(MachO *macho, uint64_t offset, size_t size, void *outBuf)
 {
+    if (macho->containingCache) {
+        // When this MachO is inside the DSC, it will have segments that point to "out of macho" memory
+        // So, attempt to translate every offset we get
+        // Problem: Translation doesn't work before the segments have been loaded and loading the segments requires this function
+        // Solution: Gracefully fall back to memory_stream_read in the case where translation fails
+        uint64_t vmaddr = 0;
+        if (macho_translate_fileoff_to_vmaddr(macho, offset, &vmaddr, NULL) == 0) {
+            return macho_read_at_vmaddr(macho, vmaddr, size, outBuf);
+        }
+    }
+
     return memory_stream_read(macho->stream, offset, size, outBuf);
+}
+
+int macho_read_string_at_offset(MachO *macho, uint64_t offset, char **outString)
+{
+    if (macho->containingCache) {
+        // Same as above
+        uint64_t vmaddr = 0;
+        if (macho_translate_fileoff_to_vmaddr(macho, offset, &vmaddr, NULL) == 0) {
+            return macho_read_string_at_vmaddr(macho, vmaddr, outString);
+        }
+    }
+    return memory_stream_read_string(macho->stream, offset, outString);
 }
 
 int macho_write_at_offset(MachO *macho, uint64_t offset, size_t size, const void *inBuf)
@@ -28,6 +52,21 @@ MemoryStream *macho_get_stream(MachO *macho)
 uint32_t macho_get_filetype(MachO *macho)
 {
     return macho->machHeader.filetype;
+}
+
+struct mach_header *macho_get_mach_header(MachO *macho)
+{
+    return &macho->machHeader;
+}
+
+size_t macho_get_mach_header_size(MachO *macho)
+{
+    return macho->is32Bit ? sizeof(struct mach_header) : sizeof(struct mach_header_64);
+}
+
+DyldSharedCache *macho_get_containing_cache(MachO *macho)
+{
+    return macho->containingCache;
 }
 
 int macho_translate_fileoff_to_vmaddr(MachO *macho, uint64_t fileoff, uint64_t *vmaddrOut, MachOSegment **segmentOut)
@@ -63,18 +102,43 @@ int macho_translate_vmaddr_to_fileoff(MachO *macho, uint64_t vmaddr, uint64_t *f
 
 int macho_read_at_vmaddr(MachO *macho, uint64_t vmaddr, size_t size, void *outBuf)
 {
-    MachOSegment *segment;
-    uint64_t fileoff = 0;
-    int r = macho_translate_vmaddr_to_fileoff(macho, vmaddr, &fileoff, &segment);
-    if (r != 0) return r;
-
-    uint64_t readEnd = vmaddr + size;
-    if (readEnd >= (segment->command.vmaddr + segment->command.vmsize)) {
-        // prevent OOB
-        return -1;
+    if (macho->containingCache) {
+        return dsc_read_from_vmaddr(macho->containingCache, vmaddr, size, outBuf);
     }
+    else {
+        MachOSegment *segment;
+        uint64_t fileoff = 0;
+        int r = macho_translate_vmaddr_to_fileoff(macho, vmaddr, &fileoff, &segment);
+        if (r != 0) return r;
 
-    return macho_read_at_offset(macho, fileoff, size, outBuf);
+        uint64_t readEnd = vmaddr + size;
+        if (readEnd >= (segment->command.vmaddr + segment->command.vmsize)) {
+            // prevent OOB
+            return -1;
+        }
+
+        return macho_read_at_offset(macho, fileoff, size, outBuf);
+    }
+}
+
+int macho_read_string_at_vmaddr(MachO *macho, uint64_t vmaddr, char **outString)
+{
+    if (macho->containingCache) {
+        return dsc_read_string_from_vmaddr(macho->containingCache, vmaddr, outString);
+    }
+    else {
+        MachOSegment *segment;
+        uint64_t fileoff = 0;
+        int r = macho_translate_vmaddr_to_fileoff(macho, vmaddr, &fileoff, &segment);
+        if (r != 0) return r;
+
+        if (vmaddr >= (segment->command.vmaddr + segment->command.vmsize)) {
+            // prevent OOB
+            return -1;
+        }
+
+        return macho_read_string_at_offset(macho, fileoff, outString);
+    }
 }
 
 int macho_write_at_vmaddr(MachO *macho, uint64_t vmaddr, size_t size, const void *inBuf)
@@ -101,21 +165,21 @@ int macho_enumerate_load_commands(MachO *macho, void (^enumeratorBlock)(struct l
     }
 
     // First load command starts after mach header
-    uint64_t offset = sizeof(struct mach_header_64);
+    uint64_t offset = macho_get_mach_header_size(macho);
 
     for (int j = 0; j < macho->machHeader.ncmds; j++) {
         struct load_command loadCommand;
-        macho_read_at_offset(macho, offset, sizeof(loadCommand), &loadCommand);
+        if (macho_read_at_offset(macho, offset, sizeof(loadCommand), &loadCommand) != 0) continue;
         LOAD_COMMAND_APPLY_BYTE_ORDER(&loadCommand, LITTLE_TO_HOST_APPLIER);
 
         if (strcmp(load_command_to_string(loadCommand.cmd), "LC_UNKNOWN") == 0)
-		{
-			printf("Ignoring unknown command: 0x%x.\n", loadCommand.cmd);
-		}
+        {
+            printf("Ignoring unknown command: 0x%x.\n", loadCommand.cmd);
+        }
         else {
             // TODO: Check if cmdsize matches expected size for cmd
             uint8_t cmd[loadCommand.cmdsize];
-            macho_read_at_offset(macho, offset, loadCommand.cmdsize, cmd);
+            if (macho_read_at_offset(macho, offset, loadCommand.cmdsize, cmd) != 0) continue;
             bool stop = false;
             enumeratorBlock(loadCommand, offset, (void *)cmd, &stop);
             if (stop) break;
@@ -125,31 +189,92 @@ int macho_enumerate_load_commands(MachO *macho, void (^enumeratorBlock)(struct l
     return 0;
 }
 
+int macho_enumerate_segments(MachO *macho, void (^enumeratorBlock)(struct segment_command_64 *segment, bool *stop))
+{
+    for (uint32_t i = 0; i < macho->segmentCount; i++) {
+        bool stop = false;
+        enumeratorBlock(&macho->segments[i]->command, &stop);
+        if (stop) return 0;
+    }
+    return 0;
+}
+
+int macho_enumerate_sections(MachO *macho, void (^enumeratorBlock)(struct section_64 *section, struct segment_command_64 *segment, bool *stop))
+{
+    for (uint32_t i = 0; i < macho->segmentCount; i++) {
+        for (uint32_t k = 0; k < macho->segments[i]->command.nsects; k++) {
+            bool stop = false;
+            enumeratorBlock(&macho->segments[i]->sections[k], &macho->segments[i]->command, &stop);
+            if (stop) return 0;
+        }
+    }
+    return 0;
+}
+
 int macho_enumerate_symbols(MachO *macho, void (^enumeratorBlock)(const char *name, uint8_t type, uint64_t vmaddr, bool *stop))
 {
+    bool didScanDSC = false;
+
+    if (macho->containingCache && macho->cacheImage) {
+        // For stuff inside the DSC we need to use the cache image to also be able to fetch private symbols
+        // Private symbols are normally replaced with <redacted> in the LC_SYMTAB of the MachO
+        didScanDSC = (dsc_image_enumerate_symbols(macho->containingCache, macho->cacheImage, enumeratorBlock) == 0);
+    }
+
     macho_enumerate_load_commands(macho, ^(struct load_command loadCommand, uint64_t offset, void *cmd, bool *stop) {
         if (loadCommand.cmd == LC_SYMTAB) {
             struct symtab_command *symtabCommand = (struct symtab_command *)cmd;
             SYMTAB_COMMAND_APPLY_BYTE_ORDER(symtabCommand, LITTLE_TO_HOST_APPLIER);
-            char strtbl[symtabCommand->strsize];
-            macho_read_at_offset(macho, symtabCommand->stroff, symtabCommand->strsize, strtbl);
+            char *strtbl = malloc(symtabCommand->strsize);
+            if (macho_read_at_offset(macho, symtabCommand->stroff, symtabCommand->strsize, strtbl) != 0) {
+                free(strtbl);
+                return;
+            }
 
             for (int i = 0; i < symtabCommand->nsyms; i++) {
-                struct nlist_64 entry = { 0 };
-                macho_read_at_offset(macho, symtabCommand->symoff + (i * sizeof(entry)), sizeof(entry), &entry);
-                NLIST_64_APPLY_BYTE_ORDER(&entry, LITTLE_TO_HOST_APPLIER);
-                if (entry.n_un.n_strx >= symtabCommand->strsize || entry.n_un.n_strx == 0) continue;
+                uint64_t n_strx = 0;
+                uint64_t n_value = 0;
+                uint8_t n_type = 0;
+                int r = 0;
 
-                const char *symbolName = &strtbl[entry.n_un.n_strx];
+                #define _GENERIC_READ_NLIST(nlistType, APPLIER) do { \
+                    struct nlistType entry; \
+                    if ((r = macho_read_at_offset(macho, symtabCommand->symoff + (i * sizeof(entry)), sizeof(entry), &entry)) != 0) break; \
+                    APPLIER(&entry, LITTLE_TO_HOST_APPLIER); \
+                    n_strx = entry.n_un.n_strx; \
+                    n_value = entry.n_value; \
+                    n_type = entry.n_type; \
+                } while (0)
+
+                if (macho->is32Bit) {
+                    _GENERIC_READ_NLIST(nlist, NLIST_APPLY_BYTE_ORDER);
+                }
+                else {
+                    _GENERIC_READ_NLIST(nlist_64, NLIST_64_APPLY_BYTE_ORDER);
+                }
+
+                if (r != 0) continue;
+    
+                #undef _GENERIC_READ_NLIST
+
+                if (n_strx >= symtabCommand->strsize || n_strx == 0) continue;
+
+                const char *symbolName = &strtbl[n_strx];
                 if (symbolName[0] == 0) continue;
 
+                if (didScanDSC) {
+                    /* If we already got the real private symbols from the DSC, omit any censored ones */
+                    if (!strcmp(symbolName, "<redacted>")) continue;
+                }
+
                 bool stopSym = false;
-                enumeratorBlock(symbolName, entry.n_type, entry.n_value, &stopSym);
+                enumeratorBlock(symbolName, n_type, n_value, &stopSym);
                 if (stopSym) {
                     *stop = true;
-                    break;   
+                    break;
                 }
             }
+            free(strtbl);
         }
     });
 
@@ -225,10 +350,124 @@ int macho_enumerate_rpaths(MachO *macho, void (^enumeratorBlock)(const char *rpa
     return 0;
 }
 
+uint64_t macho_get_base_address(MachO *macho)
+{
+    if (macho->cachedBase) return macho->cachedBase;
+    __block int64_t base = UINT64_MAX;
+    macho_enumerate_load_commands(macho, ^(struct load_command loadCommand, uint64_t offset, void *cmd, bool *stop) {
+        if (loadCommand.cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *segmentCommand = (struct segment_command_64 *)cmd;
+            SEGMENT_COMMAND_64_APPLY_BYTE_ORDER(segmentCommand, LITTLE_TO_HOST_APPLIER);
+            if (strncmp(segmentCommand->segname, "__PRELINK", 9) != 0 
+                && strncmp(segmentCommand->segname, "__PLK", 5) != 0) {
+                // PRELINK is before the actual base, so we ignore it
+                if (segmentCommand->vmaddr < base) {
+                    base = segmentCommand->vmaddr;
+                }
+            }
+        }
+    });
+    macho->cachedBase = base;
+    return macho->cachedBase;
+}
+
+int macho_enumerate_function_starts(MachO *macho, void (^enumeratorBlock)(uint64_t funcAddr, bool *stop))
+{
+    __block uint64_t functionStartsDataOff = 0, functionStartsDataSize = 0;
+
+    macho_enumerate_load_commands(macho, ^(struct load_command loadCommand, uint64_t offset, void *cmd, bool *stopLC) {
+        if (loadCommand.cmd == LC_FUNCTION_STARTS) {
+            struct linkedit_data_command *functionStartsCommand = (struct linkedit_data_command *)cmd;
+            LINKEDIT_DATA_COMMAND_APPLY_BYTE_ORDER(functionStartsCommand, LITTLE_TO_HOST_APPLIER);
+            functionStartsDataOff = functionStartsCommand->dataoff;
+            functionStartsDataSize = functionStartsCommand->datasize;
+            *stopLC = true;
+        }
+    });
+
+    if (!functionStartsDataOff || !functionStartsDataSize) return -1;
+
+    uint8_t *info = malloc(functionStartsDataSize);
+    if (macho_read_at_offset(macho, functionStartsDataOff, functionStartsDataSize, info) == 0) {
+        uint8_t *infoEnd = &info[functionStartsDataSize];
+        uint64_t address = macho_get_base_address(macho);
+        for (uint8_t *p = info; (*p != 0) && (p < infoEnd); ) {
+            bool stop = false;
+            uint64_t delta = 0;
+            uint32_t shift = 0;
+            bool more = true;
+            do {
+                uint8_t byte = *p++;
+                delta |= ((byte & 0x7F) << shift);
+                shift += 7;
+                if (byte < 0x80) {
+                    address += delta;
+                    enumeratorBlock(address, &stop);
+                    more = false;
+                }
+            } while (more);
+            if (stop) break;
+        }
+    }
+    free(info);
+
+    return 0;
+}
+
 int macho_parse_segments(MachO *macho)
 {
     return macho_enumerate_load_commands(macho, ^(struct load_command loadCommand, uint64_t offset, void *cmd, bool *stop) {
-        if (loadCommand.cmd == LC_SEGMENT_64) {
+        if (macho->is32Bit && loadCommand.cmd == LC_SEGMENT) {
+            macho->segmentCount++;
+            if (macho->segments == NULL) { macho->segments = malloc(macho->segmentCount * sizeof(MachOSegment*)); }
+            else { macho->segments = realloc(macho->segments, macho->segmentCount * sizeof(MachOSegment*)); }
+            
+            // For simplicity, we convert segment_command's to segment_command_64's
+            // This allowes all logic to unifily operate on segment_command_64
+
+            struct segment_command segmentCommand;
+            memcpy(&segmentCommand, cmd, sizeof(segmentCommand));
+            SEGMENT_COMMAND_APPLY_BYTE_ORDER(&segmentCommand, LITTLE_TO_HOST_APPLIER);
+            
+            MachOSegment **segment = &macho->segments[macho->segmentCount-1];
+            
+            *segment = malloc(sizeof(MachOSegment) + segmentCommand.nsects * sizeof(struct section_64));
+            (*segment)->command = (struct segment_command_64) {
+                .cmd = segmentCommand.cmd,
+                .cmdsize = segmentCommand.cmdsize,
+                .fileoff = segmentCommand.fileoff,
+                .filesize = segmentCommand.filesize,
+                .vmaddr = segmentCommand.vmaddr,
+                .vmsize = segmentCommand.vmsize,
+                .flags = segmentCommand.flags,
+                .initprot = segmentCommand.initprot,
+                .maxprot = segmentCommand.maxprot,
+                .nsects = segmentCommand.nsects,
+            };
+            memcpy((*segment)->command.segname, segmentCommand.segname, sizeof(segmentCommand.segname));
+            
+            for (uint32_t i = 0; i < macho->segments[macho->segmentCount-1]->command.nsects; i++) {
+                struct section section;
+                memcpy(&section, cmd + sizeof(struct segment_command) + (i * sizeof(struct section)), sizeof(section));
+                SECTION_APPLY_BYTE_ORDER(&section, LITTLE_TO_HOST_APPLIER);
+                
+                (*segment)->sections[i] = (struct section_64) {
+                    .addr = section.addr,
+                    .align = section.align,
+                    .flags = section.flags,
+                    .nreloc = section.nreloc,
+                    .offset = section.offset,
+                    .reserved1 = section.reserved1,
+                    .reserved2 = section.reserved2,
+                    .reserved3 = 0,
+                    .size = section.size,
+                };
+                
+                memcpy((*segment)->sections[i].sectname, section.sectname, sizeof(section.sectname));
+                memcpy((*segment)->sections[i].segname, section.segname, sizeof(section.segname));
+            }
+        }
+        else if (!macho->is32Bit && loadCommand.cmd == LC_SEGMENT_64) {
             macho->segmentCount++;
             if (macho->segments == NULL) { macho->segments = malloc(macho->segmentCount * sizeof(MachOSegment*)); }
             else { macho->segments = realloc(macho->segments, macho->segmentCount * sizeof(MachOSegment*)); }
@@ -272,19 +511,13 @@ int macho_parse_fileset_machos(MachO *macho)
 
 int _macho_parse(MachO *macho)
 {
-    // Determine if this arch is supported by ChOma
-    macho->isSupported = (macho->archDescriptor.cpusubtype != 0x9);
-
-    if (macho->isSupported) {
-        // Ensure that the sizeofcmds is a multiple of 8 (it would need padding otherwise)
-        if (macho->machHeader.sizeofcmds % 8 != 0) {
-            printf("Error: sizeofcmds is not a multiple of 8.\n");
-            return -1;
-        }
-
-        macho_parse_segments(macho);
-        macho_parse_fileset_machos(macho);
+    macho->is32Bit = (macho->archDescriptor.cpusubtype == CPU_SUBTYPE_ARM_V6 || macho->archDescriptor.cpusubtype == CPU_SUBTYPE_ARM_V7 || macho->archDescriptor.cpusubtype == CPU_SUBTYPE_ARM_V7S);
+    if (macho->machHeader.sizeofcmds % (macho->is32Bit ? sizeof(uint32_t) : sizeof(uint64_t)) != 0) {
+        printf("Error: sizeofcmds is not a multiple of %lu (%d).\n", macho->is32Bit ? sizeof(uint32_t) : sizeof(uint64_t), macho->machHeader.sizeofcmds);
+        return -1;
     }
+    macho_parse_segments(macho);
+    macho_parse_fileset_machos(macho);
     return 0;
 }
 
@@ -296,7 +529,7 @@ MachO *macho_init(MemoryStream *stream, struct fat_arch_64 archDescriptor)
 
     macho->stream = stream;
     macho->archDescriptor = archDescriptor;
-    macho_read_at_offset(macho, 0, sizeof(macho->machHeader), &macho->machHeader);
+    if (macho_read_at_offset(macho, 0, sizeof(macho->machHeader), &macho->machHeader) != 0) goto fail;
     MACH_HEADER_APPLY_BYTE_ORDER(&macho->machHeader, LITTLE_TO_HOST_APPLIER);
 
     // Check the magic against the expected values
@@ -323,7 +556,7 @@ MachO *macho_init_for_writing(const char *filePath)
     if (!macho->stream) goto fail;
 
     size_t fileSize = memory_stream_get_size(macho->stream);
-    memory_stream_read(macho->stream, 0, sizeof(struct mach_header_64), &macho->machHeader);
+    memory_stream_read(macho->stream, 0, sizeof(struct mach_header), &macho->machHeader);
     MACH_HEADER_APPLY_BYTE_ORDER(&macho->machHeader, HOST_TO_LITTLE_APPLIER);
     if (macho->machHeader.magic != MH_MAGIC_64) goto fail;
 
@@ -343,13 +576,13 @@ fail:
 }
 
 MachO **macho_array_create_for_paths(char **inputPaths, int inputPathsCount) {
-    FAT **fatArray = malloc(sizeof(FAT *) * inputPathsCount);
+    Fat **fatArray = malloc(sizeof(Fat *) * inputPathsCount);
     MachO **machoArray;
     int sliceCount = 0;
     for (int i = 0; i < inputPathsCount; i++) {
-        FAT *fat = fat_init_from_path(inputPaths[i]);
+        Fat *fat = fat_init_from_path(inputPaths[i]);
         if (!fat) {
-            printf("Error: failed to create FAT from file: %s\n", inputPaths[i]);
+            printf("Error: failed to create Fat from file: %s\n", inputPaths[i]);
             return NULL;
         }
         sliceCount += fat->slicesCount;

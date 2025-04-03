@@ -2,6 +2,7 @@
 #define PATCHFINDER_ARM64_H
 
 #include "PatchFinder.h"
+#include "arm64.h"
 
 typedef enum {
     ARM64_XREF_TYPE_BL = 0,
@@ -16,6 +17,7 @@ typedef enum {
     ARM64_XREF_TYPE_ADRP_ADD,
     ARM64_XREF_TYPE_ADRP_LDR,
     ARM64_XREF_TYPE_ADRP_STR,
+    ARM64_XREF_TYPE_POINTER,
 } Arm64XrefType;
 
 typedef enum {
@@ -36,10 +38,13 @@ typedef enum {
     ARM64_XREF_TYPE_MASK_ADRP_LDR = (1 << ARM64_XREF_TYPE_ADRP_LDR),
     ARM64_XREF_TYPE_MASK_ADRP_STR = (1 << ARM64_XREF_TYPE_ADRP_STR),
     ARM64_XREF_TYPE_MASK_REFERENCE = (ARM64_XREF_TYPE_MASK_ADR | ARM64_XREF_TYPE_MASK_ADRP_ADD | ARM64_XREF_TYPE_MASK_ADRP_LDR | ARM64_XREF_TYPE_MASK_ADRP_STR),
+    
+    ARM64_XREF_TYPE_MASK_POINTER = (1 << ARM64_XREF_TYPE_POINTER),
 
-    ARM64_XREF_TYPE_ALL = (ARM64_XREF_TYPE_MASK_CALL | ARM64_XREF_TYPE_MASK_JUMP | ARM64_XREF_TYPE_MASK_REFERENCE),
+    ARM64_XREF_TYPE_ALL = (ARM64_XREF_TYPE_MASK_CALL | ARM64_XREF_TYPE_MASK_JUMP | ARM64_XREF_TYPE_MASK_REFERENCE | ARM64_XREF_TYPE_MASK_POINTER),
 } Arm64XrefTypeMask;
 
+bool pfsec_arm64_scan_register_write(PFSection *section, arm64_register reg, uint64_t endAddr, uint64_t startAddr);
 uint64_t pfsec_arm64_resolve_adrp_ldr_str_add_reference(PFSection *section, uint64_t adrpAddr, uint64_t ldrStrAddAddr);
 uint64_t pfsec_arm64_resolve_adrp_ldr_str_add_reference_auto(PFSection *section, uint64_t ldrStrAddAddr);
 uint64_t pfsec_arm64_resolve_stub(PFSection *section, uint64_t stubAddr);

@@ -1,4 +1,4 @@
-#include "choma/FileStream.h"
+#include <choma/FileStream.h>
 #include <choma/CSBlob.h>
 #include <choma/CodeDirectory.h>
 #include <choma/MachOLoadCommand.h>
@@ -40,8 +40,8 @@ void print_usage(char *executablePath) {
     printf("\t-d: Parse code signature data (use with -c)\n");
     printf("\t-h: Print this message\n");
     printf("Examples:\n");
-    printf("\t%s -i <path to FAT/MachO file> -c\n", executablePath);
-    printf("\t%s -i <path to FAT/MachO file> -c -s -v\n", executablePath);
+    printf("\t%s -i <path to Fat/MachO file> -c\n", executablePath);
+    printf("\t%s -i <path to Fat/MachO file> -c -s -v\n", executablePath);
     printf("\t%s -i <path to kernelcache file> -f\n", executablePath);
     exit(-1);
 }
@@ -91,9 +91,9 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    // Initialise the FAT structure
-    printf("Initialising FAT structure from %s.\n", inputPath);
-    FAT *fat = fat_init_from_path(inputPath);
+    // Initialise the Fat structure
+    printf("Initialising Fat structure from %s.\n", inputPath);
+    Fat *fat = fat_init_from_path(inputPath);
     if (!fat) return -1;
 
     for (int i = 0; i < fat->slicesCount; i++) {
@@ -101,6 +101,10 @@ int main(int argc, char *argv[]) {
         printf("Slice %d (arch %x/%x, macho %x/%x):\n", i, slice->archDescriptor.cputype, slice->archDescriptor.cpusubtype, slice->machHeader.cputype, slice->machHeader.cpusubtype);
         if (argument_exists(argc, argv, "-c")) {
             CS_SuperBlob *superblob = macho_read_code_signature(slice);
+            if (!superblob) {
+                printf("Slice %d is not signed at all.\n", i);
+                continue;
+            }
             CS_DecodedSuperBlob *decodedSuperBlob = csd_superblob_decode(superblob);
             csd_superblob_print_content(decodedSuperBlob, slice, argument_exists(argc, argv, "-s"), argument_exists(argc, argv, "-v"));
             if (argument_exists(argc, argv, "-e")) {

@@ -8,6 +8,7 @@
 #include "Util.h"
 #include <mach-o/loader.h>
 #include <stddef.h>
+#include <stdint.h>
 
 const char *cs_blob_magic_to_string(uint32_t magic)
 {
@@ -117,8 +118,12 @@ CS_SuperBlob *macho_read_code_signature(MachO *macho)
     uint32_t offset = 0, size = 0;
     if (macho_find_code_signature_bounds(macho, &offset, &size) == 0) {
         CS_SuperBlob *dataOut = malloc(size);
-        macho_read_at_offset(macho, offset, size, dataOut);
-        return dataOut;
+        if (macho_read_at_offset(macho, offset, size, dataOut) == 0) {
+            return dataOut;
+        }
+        else {
+            free(dataOut);
+        }
     }
     return NULL;
 }
@@ -252,11 +257,14 @@ CS_DecodedSuperBlob *csd_superblob_init(void)
 
 CS_DecodedSuperBlob *csd_superblob_decode(CS_SuperBlob *superblob)
 {
+    uint32_t magic = BIG_TO_HOST(superblob->magic);
+    if (magic != CSMAGIC_EMBEDDED_SIGNATURE && magic != CSMAGIC_DETACHED_SIGNATURE) return NULL;
+
     CS_DecodedSuperBlob *decodedSuperblob = csd_superblob_init();
     if (!decodedSuperblob) return NULL;
 
     CS_DecodedBlob **nextBlob = &decodedSuperblob->firstBlob;
-    decodedSuperblob->magic = BIG_TO_HOST(superblob->magic);
+    decodedSuperblob->magic = magic;
 
     for (uint32_t i = 0; i < BIG_TO_HOST(superblob->count); i++) {
         CS_BlobIndex curIndex = superblob->index[i];
@@ -331,6 +339,23 @@ CS_DecodedBlob *csd_superblob_find_blob(CS_DecodedSuperBlob *superblob, uint32_t
     return NULL;
 }
 
+CS_DecodedBlob *csd_superblob_find_blob_by_magic(CS_DecodedSuperBlob *superblob, uint32_t magic, uint32_t *indexOut)
+{
+    CS_DecodedBlob *blob = superblob->firstBlob;
+    uint32_t i = 0;
+    while (blob) {
+        uint32_t blobMagic = 0;
+        memory_stream_read(blob->stream, 0, sizeof(uint32_t), &blobMagic);
+        if (BIG_TO_HOST(blobMagic) == magic) {
+            if (indexOut) *indexOut = i;
+            return blob;
+        }
+        blob = blob->next;
+        i++;
+    }
+    return NULL;
+}
+
 int csd_superblob_insert_blob_after_blob(CS_DecodedSuperBlob *superblob, CS_DecodedBlob *blobToInsert, CS_DecodedBlob *afterBlob)
 {
     blobToInsert->next = afterBlob->next;
@@ -371,6 +396,19 @@ int csd_superblob_append_blob(CS_DecodedSuperBlob *superblob, CS_DecodedBlob *bl
         lastBlob = lastBlob->next;
     }
     return csd_superblob_insert_blob_after_blob(superblob, blobToAppend, lastBlob);
+}
+
+int csd_superblob_replace_blob(CS_DecodedSuperBlob *superblob, CS_DecodedBlob *newBlob)
+{
+    uint32_t index = 0;
+    CS_DecodedBlob *blob = csd_superblob_find_blob(superblob, newBlob->type, &index);
+    if (blob) {
+        csd_superblob_remove_blob_at_index(superblob, index);
+        csd_superblob_insert_blob_at_index(superblob, newBlob, index);
+    } else {
+        csd_superblob_append_blob(superblob, newBlob);
+    }
+    return 0;
 }
 
 int csd_superblob_remove_blob(CS_DecodedSuperBlob *superblob, CS_DecodedBlob *blobToRemove)
@@ -432,10 +470,11 @@ CS_DecodedBlob *csd_superblob_find_best_code_directory(CS_DecodedSuperBlob *deco
     return bestCDBlob;
 }
 
-int csd_superblob_calculate_best_cdhash(CS_DecodedSuperBlob *decodedSuperblob, void *cdhashOut)
+int csd_superblob_calculate_best_cdhash(CS_DecodedSuperBlob *decodedSuperblob, void *cdhashOut, int *cdhashTypeOut)
 {
     if (!cdhashOut) return -1;
     CS_DecodedBlob *bestCDBlob = csd_superblob_find_best_code_directory(decodedSuperblob);
+    if (cdhashTypeOut) *cdhashTypeOut = csd_code_directory_get_hash_type(bestCDBlob);
     return csd_code_directory_calculate_hash(bestCDBlob, cdhashOut);
 }
 

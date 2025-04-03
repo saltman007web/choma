@@ -28,7 +28,7 @@
 
 char *extract_preferred_slice(const char *fatPath)
 {
-    FAT *fat = fat_init_from_path(fatPath);
+    Fat *fat = fat_init_from_path(fatPath);
     if (!fat) return NULL;
     MachO *macho = fat_find_preferred_slice(fat);
 
@@ -60,14 +60,9 @@ char *extract_preferred_slice(const char *fatPath)
     }
 #endif // TARGET_OS_MAC && !TARGET_OS_IPHONE
 
-    if (macho->machHeader.filetype == MH_OBJECT) {
-        printf("Error: MachO is an object file, please use a MachO executable or dynamic library!\n");
-        fat_free(fat);
-        return NULL;
-    }
-
-    if (macho->machHeader.filetype == MH_DSYM) {
-        printf("Error: MachO is a dSYM file, please use a MachO executable or dynamic library!\n");
+    // Only re-sign MH_EXECUTE, MH_DYLIB, and MH_BUNDLE
+    if (macho->machHeader.filetype != MH_EXECUTE && macho->machHeader.filetype != MH_DYLIB && macho->machHeader.filetype != MH_BUNDLE) {
+        printf("Error: MachO is not an executable, dynamic library, or bundle! This is an unsupported MachO type for code-signing.\n");
         fat_free(fat);
         return NULL;
     }
@@ -140,11 +135,12 @@ void print_usage(const char *self)
     printf("\t-o: output file\n");
     printf("\t-r: replace input file / replace output file if it already exists\n");
     printf("\t-a: input is an .app bundle\n");
-    printf("\t-t: optional 10-character team ID to use\n");
+    printf("\t-t: optional team ID to use\n");
+    printf("\t-I: optional identifier to use\n");
     printf("\t-A: optional path to App Store binary to use (will use GTA Car Tracker by default)\n");
     printf("\t-h: print this help message\n");
     printf("Examples:\n");
-    printf("\t%s -i <path to input MachO/FAT file> (-r) (-o <path to output MachO file>)\n", self);
+    printf("\t%s -i <path to input MachO/Fat file> (-r) (-o <path to output MachO file>)\n", self);
     printf("\t%s -i <path to input .app bundle> -a\n", self);
     exit(-1);
 }
@@ -413,7 +409,7 @@ int update_signature_blob(CS_DecodedSuperBlob *superblob, void *appStoreSigBlob,
     return csd_superblob_append_blob(superblob, signatureBlob);
 }
 
-int apply_coretrust_bypass(const char *machoPath, char *teamID, char *appStoreBinary)
+int apply_coretrust_bypass(const char *machoPath, char *teamID, char *identifier, char *appStoreBinary)
 {
     MachO *macho = macho_init_for_writing(machoPath);
     if (!macho) return -1;
@@ -505,13 +501,21 @@ int apply_coretrust_bypass(const char *machoPath, char *teamID, char *appStoreBi
     // ?. DER entitlements
     // 5. Actual CodeDirectory (SHA256)
 
+    if (identifier) {
+        printf("Updating identifier...\n");
+        if (csd_code_directory_set_identifier(realCodeDirBlob, identifier) != 0) {
+            printf("Error: failed to set identifier\n");
+            return 1;
+        }
+    }
+
     printf("Updating TeamID...\n");
 
     // Get team ID from AppStore code directory
     // For the bypass to work, both code directories need to have the same team ID
     char *appStoreTeamID = csd_code_directory_copy_team_id(appStoreCodeDirectoryBlob, NULL);
     if (!appStoreTeamID) {
-        printf("Error: Unable to determine AppStore Team ID\n");
+        printf("Error: Unable to determine App Store Team ID\n");
         return -1;
     }
 
@@ -521,8 +525,8 @@ int apply_coretrust_bypass(const char *machoPath, char *teamID, char *appStoreBi
         return -1;
     }
 
-    printf("TeamID set to %s!\n", appStoreTeamID);
-    free(appStoreTeamID);
+    printf("TeamID set to %s!\n", teamID ? teamID : appStoreTeamID);
+    if (appStoreTeamID) { free(appStoreTeamID); }
 
     // Set flags to 0 to remove any problematic flags (such as the 'adhoc' flag in bit 2)
     csd_code_directory_set_flags(realCodeDirBlob, 0);
@@ -541,7 +545,7 @@ int apply_coretrust_bypass(const char *machoPath, char *teamID, char *appStoreBi
     CS_SuperBlob *encodedSuperblobUnsigned = csd_superblob_encode(decodedSuperblob);
 
     printf("Updating load commands...\n");
-    if (update_load_commands_for_coretrust_bypass(macho, encodedSuperblobUnsigned, originalCodeSignatureSize, memory_stream_get_size(macho->stream)) != 0) {
+    if (update_load_commands_for_coretrust_bypass(macho, encodedSuperblobUnsigned, originalCodeSignatureSize) != 0) {
         printf("Error: failed to update load commands!\n");
         return -1;
     }
@@ -571,7 +575,7 @@ int apply_coretrust_bypass(const char *machoPath, char *teamID, char *appStoreBi
     return 0;
 }
 
-int apply_coretrust_bypass_wrapper(const char *inputPath, const char *outputPath, char *teamID, char *appStoreBinary)
+int apply_coretrust_bypass_wrapper(const char *inputPath, const char *outputPath, char *teamID, char *identifier, char *appStoreBinary)
 {
     char *machoPath = extract_preferred_slice(inputPath);
     if (!machoPath) {
@@ -580,7 +584,7 @@ int apply_coretrust_bypass_wrapper(const char *inputPath, const char *outputPath
     }
     printf("extracted best slice to %s\n", machoPath);
 
-    int r = apply_coretrust_bypass(machoPath, teamID, appStoreBinary);
+    int r = apply_coretrust_bypass(machoPath, teamID, identifier, appStoreBinary);
     if (r != 0) {
         free(machoPath);
         return r;
@@ -599,7 +603,7 @@ int apply_coretrust_bypass_wrapper(const char *inputPath, const char *outputPath
     return r;
 }
 
-int apply_coretrust_bypass_to_app_bundle(const char *appBundlePath, char *teamID, char *appStoreBinary) {
+int apply_coretrust_bypass_to_app_bundle(const char *appBundlePath, char *teamID, char *identifier, char *appStoreBinary) {
     // Recursively find all MachO files in the app bundle
     DIR *dir;
     struct dirent *entry;
@@ -623,7 +627,7 @@ int apply_coretrust_bypass_to_app_bundle(const char *appBundlePath, char *teamID
         if (S_ISDIR(statbuf.st_mode)) {
             if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
                 // Recursive call for subdirectories
-                r = apply_coretrust_bypass_to_app_bundle(fullpath, teamID, appStoreBinary);
+                r = apply_coretrust_bypass_to_app_bundle(fullpath, teamID, identifier, appStoreBinary);
             }
         } else {
             // Process file
@@ -636,7 +640,7 @@ int apply_coretrust_bypass_to_app_bundle(const char *appBundlePath, char *teamID
             memory_stream_read(stream, 0, sizeof(magic), &magic);
             if (magic == FAT_MAGIC_64 || magic == MH_MAGIC_64) {
                 printf("Applying bypass to %s.\n", fullpath);
-                r = apply_coretrust_bypass_wrapper(fullpath, fullpath, teamID, appStoreBinary);
+                r = apply_coretrust_bypass_wrapper(fullpath, fullpath, teamID, identifier, appStoreBinary);
                 if (r != 0) {
                     printf("Error: failed to apply bypass to %s\n", fullpath);
                     closedir(dir);
@@ -662,13 +666,8 @@ int main(int argc, char *argv[]) {
     bool replace = argument_exists(argc, argv, "-r");
     bool appBundle = argument_exists(argc, argv, "-a");
     char *teamID = get_argument_value(argc, argv, "-t");
+    char *identifier = get_argument_value(argc, argv, "-I");
     char *appStoreBinary = get_argument_value(argc, argv, "-A");
-    if (teamID) {
-        if (strlen(teamID) != 10) {
-            printf("Error: Team ID must be 10 characters long!\n");
-            return -1;
-        }
-    }
     if (appBundle) {
         if (replace || output) {
             print_usage(argv[0]);
@@ -689,7 +688,7 @@ int main(int argc, char *argv[]) {
 
         printf("Applying CoreTrust bypass to app bundle.\n");
         printf("CoreTrust bypass eta s0n!!\n");
-        return apply_coretrust_bypass_to_app_bundle(input, teamID, appStoreBinary);
+        return apply_coretrust_bypass_to_app_bundle(input, teamID, identifier, appStoreBinary);
     }
     
     if (!output && !replace) {
@@ -713,7 +712,7 @@ int main(int argc, char *argv[]) {
     }
 
     printf("CoreTrust bypass eta s0n!!\n");
-    return apply_coretrust_bypass_wrapper(input, output, teamID, appStoreBinary);
+    return apply_coretrust_bypass_wrapper(input, output, teamID, identifier, appStoreBinary);
 }
 
 #else
@@ -722,4 +721,4 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-#endif
+#endif // DISABLE_SIGNING
